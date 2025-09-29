@@ -1,0 +1,130 @@
+# POC Routing Repository Rules
+
+## Project Overview
+This is a POC for dynamic routing using Envoy + Lua to route `GET /join?client_id=...` to specific server instances. Must work on both Docker Compose and Kubernetes (Minikube).
+
+## Architecture Rules
+
+### Server API Contract
+- MUST implement `GET /where?client_id=...` → `{ client_id, hostport }` (deterministic mapping)
+- MUST implement `GET /join?client_id=...` → logs registration on the handling instance
+- MUST use cross-platform routing calculation via environment variables
+
+### Cross-Platform Configuration
+Server MUST compute target names using these environment variables:
+
+**Docker Compose:**
+- SERVICE_PREFIX=poc-routing-server
+- SERVICE_SUFFIX= (empty)
+- REPLICAS=2
+- INDEX_MODE=hash (default)
+- INDEX_BASE=1 (names end -1..-N)
+- PORT=8081 (default)
+
+**Kubernetes:**
+- SERVICE_PREFIX=server
+- SERVICE_SUFFIX=.server-headless.poc-routing.svc.cluster.local
+- REPLICAS=2
+- INDEX_MODE=numeric
+- INDEX_BASE=0 (StatefulSet ordinals -0..-(N-1))
+- PORT=8081
+
+**Final Host Format:** `SERVICE_PREFIX-<idx><SERVICE_SUFFIX>:PORT`
+
+### Envoy + Lua Routing
+- `/join` → cluster `dynamic_forward_proxy_cluster` (per-request DNS via DFP)
+- `/` (fallback) → cluster `resolver` (service name)
+
+**Lua Per-Route Steps (MUST follow exactly):**
+1. Parse `client_id` from path
+2. `httpCall` to resolver `/where?client_id=...`
+3. Parse `hostport` from JSON response
+4. Set `:authority` to `hostport` (DFP resolves and dials)
+5. On errors, respond 400/502 to avoid loops
+
+**Design Principles:**
+- MUST use Dynamic Forward Proxy (DFP) to honor per-request `:authority`
+- MUST attach Lua per-route only for `/join` (LuaPerRoute)
+- MUST NOT retain `headers` across `httpCall` (re-fetch after call)
+
+## File Structure
+```
+poc-routing/
+├── docker-compose.yaml
+├── envoy.yaml
+├── lua/routing.lua
+├── minikube/
+│   ├── kustomization.yaml
+│   ├── envoy-deployment.yaml
+│   ├── server-statefulset.yaml
+│   ├── envoy.yaml (k8s-specific)
+│   └── routing.lua (packaged via kustomize)
+├── server/ (Go server)
+└── client/ (Go client for testing)
+```
+
+## Deployment Commands
+
+### Docker Compose
+```bash
+docker compose up -d --build --scale server=2
+curl 'http://localhost:10000/where?client_id=123'
+curl -v 'http://localhost:10000/join?client_id=123'
+```
+- Envoy: 10000 (admin: 9901)
+- Server: 8081 (internal)
+
+### Kubernetes
+```bash
+minikube start
+kubectl create ns poc-routing
+kubectl -n poc-routing apply -k minikube/
+MINIKUBE_IP=$(minikube ip)
+curl "http://$MINIKUBE_IP:30080/where?client_id=123"
+curl -v "http://$MINIKUBE_IP:30080/join?client_id=123"
+```
+- Envoy: 10000 → 30080 (NodePort)
+- Envoy Admin: 9901 → 30081 (NodePort)
+- Server: 8081 (internal)
+
+## Troubleshooting
+
+### 503/504 on `/join`
+- DFP couldn't resolve/connect to `hostport`
+- Verify `/where` output; check endpoints for headless service; confirm resolver cluster target
+
+### Envoy Not Ready
+- Check `:9901/ready` and logs for config errors
+
+### Lua Errors
+- `resolver status=nil`: Header accessor differences; code reads either `get(":status")` or `[":status"]`
+- `object used outside of proper scope`: Don't retain `headers` across `httpCall`; re-fetch after call
+
+### Kubernetes DNS
+- `kube-dns` Service fronts `coredns` Pods
+- Use K8s API (Services/Endpoints/EndpointSlices) to enumerate names
+
+## Development Rules
+
+1. MUST maintain cross-platform compatibility via environment variables
+2. MUST implement proper error handling in Lua scripts
+3. MUST use deterministic routing algorithms
+4. MUST follow the established API contract
+5. MUST test both Docker Compose and Kubernetes deployments
+6. MUST verify routing works with different `client_id` values
+7. MUST test error scenarios (invalid client_id, network failures)
+
+## Security
+- MUST validate `client_id` parameter
+- MUST implement proper error responses to avoid information leakage
+- MUST use proper HTTP status codes (400, 502, 503, 504)
+
+## Environment Differences
+- **Docker Compose**: Hash-based indexing, base 1, service names: `poc-routing-server-1`, `poc-routing-server-2`
+- **Kubernetes**: Numeric indexing, base 0, service names: `server-0`, `server-1`, requires full DNS suffix
+
+When making changes:
+1. Understand current architecture first
+2. Maintain backward compatibility
+3. Update both Docker and Kubernetes configurations if needed
+4. Test changes in both environments

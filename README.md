@@ -140,12 +140,87 @@ docker build -t poc-routing-server:latest ./server
 kubectl create ns poc-routing
 kubectl -n poc-routing apply -k minikube/
 ```
-3) Test (NodePort):
+3) Test the deployment:
+
+**Option A: Using Minikube service forwarding (Recommended)**
+```bash
+# Get the forwarded URLs
+minikube service envoy -n poc-routing --url
+
+# This will output something like:
+# http://127.0.0.1:64719
+# http://127.0.0.1:64720
+
+# Test with the forwarded URL:
+curl "http://127.0.0.1:64719/where?client_id=123"
+curl -v "http://127.0.0.1:64719/join?client_id=123"
 ```
+
+**Option B: Using NodePort directly (requires tunnel)**
+```bash
+# Start Minikube tunnel in a separate terminal (keep it running)
+minikube tunnel
+
+# Then test with NodePort:
 MINIKUBE_IP=$(minikube ip)
 curl "http://$MINIKUBE_IP:30080/where?client_id=123"
 curl -v "http://$MINIKUBE_IP:30080/join?client_id=123"
 ```
+
+**Option C: Using kubectl port-forward**
+```bash
+# Port forward the service
+kubectl port-forward -n poc-routing service/envoy 10000:10000
+
+# Test locally
+curl "http://localhost:10000/where?client_id=123"
+curl -v "http://localhost:10000/join?client_id=123"
+```
+
+## Troubleshooting
+
+### Minikube External Access Issues
+
+**Problem**: `curl: (28) Failed to connect to 192.168.49.2 port 30080 after 75002 ms: Couldn't connect to server`
+
+**Root Cause**: Minikube with Docker driver on macOS requires port forwarding for external access to NodePort services.
+
+**Solutions**:
+1. **Use Minikube service forwarding** (Recommended):
+   ```bash
+   minikube service envoy -n poc-routing --url
+   # Use the returned localhost URLs
+   ```
+
+2. **Use Minikube tunnel**:
+   ```bash
+   minikube tunnel  # Keep running in separate terminal
+   # Then use NodePort directly
+   ```
+
+3. **Use kubectl port-forward**:
+   ```bash
+   kubectl port-forward -n poc-routing service/envoy 10000:10000
+   ```
+
+### Common Issues
+
+**503/504 on `/join`**:
+- DFP couldn't resolve/connect to `hostport`
+- Verify `/where` output; check endpoints for headless service; confirm resolver cluster target
+
+**Envoy not responding**:
+- Check pod status: `kubectl get pods -n poc-routing`
+- Check Envoy logs: `kubectl logs -n poc-routing deployment/envoy`
+- Verify service endpoints: `kubectl get endpoints -n poc-routing`
+
+**Lua errors**:
+- `resolver status=nil`: Header accessor differences; code reads either `get(":status")` or `[":status"]`
+- `object used outside of proper scope`: Don't retain `headers` across `httpCall`; re-fetch after call
+
+**Kubernetes DNS issues**:
+- `kube-dns` Service fronts `coredns` Pods
+- Use K8s API (Services/Endpoints/EndpointSlices) to enumerate names
 
 ## Tuning / Notes
 - Predictable names: Compose creates container DNS names `<project>-server-<idx>`. By default the project is the folder name `poc-routing`.
