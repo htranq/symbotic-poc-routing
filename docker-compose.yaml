@@ -1,0 +1,20 @@
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.30-latest
+    container_name: envoy
+    ports:
+      - "10000:10000"
+      - "9901:9901"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./lua:/etc/envoy/lua:ro
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    environment:
+      - PORT=8081
+      - SERVICE_PREFIX=poc-routing-server
+      - REPLICAS=2
+      - INDEX_MODE=hash
+      - INDEX_BASE=1

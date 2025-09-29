@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poc-routing
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy
+  namespace: poc-routing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy
+  template:
+    metadata:
+      labels:
+        app: envoy
+    spec:
+      containers:
+        - name: envoy
+          image: envoyproxy/envoy:v1.30-latest
+          ports:
+            - containerPort: 10000
+            - containerPort: 9901
+          volumeMounts:
+            - name: envoy-config-vol
+              mountPath: /etc/envoy/envoy.yaml
+              subPath: envoy.yaml
+            - name: lua-vol
+              mountPath: /etc/envoy/lua/routing.lua
+              subPath: routing.lua
+      volumes:
+        - name: envoy-config-vol
+          configMap:
+            name: envoy-config
+            items:
+              - key: envoy.yaml
+                path: envoy.yaml
+        - name: lua-vol
+          configMap:
+            name: envoy-config
+            items:
+              - key: routing.lua
+                path: routing.lua
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy
+  namespace: poc-routing
+spec:
+  selector:
+    app: envoy
+  type: NodePort
+  ports:
+    - name: http
+      port: 10000
+      targetPort: 10000
+      nodePort: 30080
+    - name: admin
+      port: 9901
+      targetPort: 9901
+      nodePort: 30081
