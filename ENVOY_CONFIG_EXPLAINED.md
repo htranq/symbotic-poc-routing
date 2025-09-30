@@ -238,6 +238,291 @@ end
 - `resolver` cluster: Static DNS resolution (service name → IPs)
 - `dynamic_forward_proxy_cluster`: Per-request DNS resolution (hostname → IP)
 
+## DFP Setup: Yes, You Need Both!
+
+### 1. **DFP Filter** (HTTP Filter)
+```yaml
+- name: envoy.filters.http.dynamic_forward_proxy
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+    dns_cache_config:
+      name: dynamic_forward_proxy_cache
+      dns_lookup_family: V4_ONLY
+```
+
+### 2. **DFP Cluster** (Cluster Type)
+```yaml
+- name: dynamic_forward_proxy_cluster
+  lb_policy: CLUSTER_PROVIDED
+  cluster_type:
+    name: envoy.clusters.dynamic_forward_proxy
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+      dns_cache_config:
+        name: dynamic_forward_proxy_cache
+        dns_lookup_family: V4_ONLY
+```
+
+## How DNS Resolution Works: Step by Step
+
+Let me trace through what happens when Lua sets `:authority` to `"server-1.server-headless.poc-routing.svc.cluster.local:8081"`:
+
+### Step 1: Lua Sets the Authority Header
+```lua
+-- In routing.lua
+local hostport = "server-1.server-headless.poc-routing.svc.cluster.local:8081"  -- From /where response
+hdr:replace(":authority", hostport)  -- Sets :authority header
+```
+
+### Step 2: DFP Filter Intercepts the Request
+```yaml
+# DFP Filter configuration
+- name: envoy.filters.http.dynamic_forward_proxy
+  typed_config:
+    dns_cache_config:
+      name: dynamic_forward_proxy_cache  # Shared cache name
+```
+
+**What happens:**
+1. DFP filter reads `:authority` header: `"server-1.server-headless.poc-routing.svc.cluster.local:8081"`
+2. Extracts hostname: `"server-1.server-headless.poc-routing.svc.cluster.local"`
+3. Checks DNS cache for `"server-1.server-headless.poc-routing.svc.cluster.local"`
+4. If not cached, performs DNS lookup
+5. Caches the resolved IP (e.g., `10.244.0.5`)
+
+### Step 3: DNS Resolution Process
+
+**DNS Resolution in Action:**
+```
+Query: server-1.server-headless.poc-routing.svc.cluster.local
+DNS Server: 10.96.0.10:53 (Kubernetes DNS)
+Response: 10.244.0.5
+```
+
+## How DNS Resolution Works: Detailed Breakdown
+
+### The Complete Flow for `/join?client_id=123`
+
+#### Step 1: Lua Script Execution
+```lua
+-- Lua extracts client_id and calls /where
+local resp_body = '{"client_id":"123","hostport":"server-1.server-headless.poc-routing.svc.cluster.local:8081"}'
+local hostport = "server-1.server-headless.poc-routing.svc.cluster.local:8081"
+
+-- Sets :authority header
+hdr:replace(":authority", hostport)
+```
+
+#### Step 2: DFP Filter DNS Resolution
+```yaml
+# DFP Filter configuration
+- name: envoy.filters.http.dynamic_forward_proxy
+  typed_config:
+    dns_cache_config:
+      name: dynamic_forward_proxy_cache
+      dns_lookup_family: V4_ONLY
+```
+
+**What happens inside DFP Filter:**
+1. **Reads `:authority` header**: `"server-1.server-headless.poc-routing.svc.cluster.local:8081"`
+2. **Extracts hostname**: `"server-1.server-headless.poc-routing.svc.cluster.local"`
+3. **Checks DNS cache**: Looks for `"server-1.server-headless.poc-routing.svc.cluster.local"` in `dynamic_forward_proxy_cache`
+4. **If not cached**: Performs DNS lookup using Kubernetes DNS (10.96.0.10:53)
+5. **DNS Resolution**: 
+   ```
+   Query: server-1.server-headless.poc-routing.svc.cluster.local
+   Response: 10.244.0.5
+   ```
+6. **Caches result**: Stores `server-1.server-headless.poc-routing.svc.cluster.local → 10.244.0.5`
+7. **Prepares request**: Ready for routing to `10.244.0.5:8081`
+
+#### Step 3: DFP Cluster Routing
+```yaml
+- name: dynamic_forward_proxy_cluster
+  lb_policy: CLUSTER_PROVIDED
+  cluster_type:
+    name: envoy.clusters.dynamic_forward_proxy
+    typed_config:
+      dns_cache_config:
+        name: dynamic_forward_proxy_cache  # Same cache as filter
+```
+
+**What happens inside DFP Cluster:**
+1. **Reads from DNS cache**: Gets `10.244.0.5` for `server-1.server-headless.poc-routing.svc.cluster.local`
+2. **Establishes connection**: Connects to `10.244.0.5:8081`
+3. **Forwards request**: Sends the original `/join?client_id=123` request
+
+## Why You Need Both Components
+
+### DFP Filter (HTTP Filter)
+- **Purpose**: DNS resolution and caching
+- **When it runs**: Before routing, after Lua modifies `:authority`
+- **What it does**: Resolves hostnames to IPs and caches them
+
+### DFP Cluster (Cluster Type)
+- **Purpose**: Actual connection and routing
+- **When it runs**: During routing phase
+- **What it does**: Uses cached IPs to connect to specific instances
+
+## DNS Resolution in Action
+
+### What Actually Happens:
+
+1. **Lua sets `:authority`**: `"server-1.server-headless.poc-routing.svc.cluster.local:8081"`
+
+2. **DFP Filter performs DNS lookup**:
+   ```
+   Query: server-1.server-headless.poc-routing.svc.cluster.local
+   DNS Server: 10.96.0.10:53 (Kubernetes DNS)
+   Response: 10.244.0.5
+   ```
+
+3. **DFP Filter caches the result**:
+   ```
+   Cache Entry:
+   Key: server-1.server-headless.poc-routing.svc.cluster.local
+   Value: 10.244.0.5
+   ```
+
+4. **DFP Cluster uses cached IP**:
+   ```
+   Connection: 10.244.0.5:8081
+   Request: GET /join?client_id=123
+   ```
+
+## Complete DNS Resolution Process
+
+### What Actually Happens:
+
+1. **Lua sets `:authority`**: `"server-1.server-headless.poc-routing.svc.cluster.local:8081"`
+
+2. **DFP Filter performs DNS lookup**:
+   ```
+   Query: server-1.server-headless.poc-routing.svc.cluster.local
+   DNS Server: 10.96.0.10:53 (Kubernetes DNS)
+   Response: 10.244.0.5
+   ```
+
+3. **DFP Filter caches the result**:
+   ```
+   Cache Entry:
+   Key: server-1.server-headless.poc-routing.svc.cluster.local
+   Value: 10.244.0.5
+   ```
+
+4. **DFP Cluster uses cached IP**:
+   ```
+   Connection: 10.244.0.5:8081
+   Request: GET /join?client_id=123
+   ```
+
+## Key Points About DFP Setup
+
+### 1. **Shared DNS Cache**
+Both the DFP Filter and DFP Cluster use the same cache name:
+```yaml
+dns_cache_config:
+  name: dynamic_forward_proxy_cache  # Same name in both
+```
+
+### 2. **DNS Lookup Family**
+```yaml
+dns_lookup_family: V4_ONLY  # Only IPv4 addresses
+```
+
+### 3. **Why This Architecture Works**
+- **DFP Filter**: Handles the DNS resolution and caching
+- **DFP Cluster**: Handles the actual connection using cached IPs
+- **Shared Cache**: Ensures the cluster uses the same resolved IPs as the filter
+
+## Verification Commands
+
+### 1. **Check Pod Status and IPs**
+```bash
+# Check all pods and their IPs
+kubectl get pods -n poc-routing -o wide
+
+# Expected output:
+# NAME                     READY   STATUS    RESTARTS   AGE     IP           NODE
+# envoy-xxx                1/1     Running   0          3d12h   10.244.0.4   minikube
+# server-0                 1/1     Running   0          3d12h   10.244.0.3   minikube
+# server-1                 1/1     Running   0          3d12h   10.244.0.5   minikube
+```
+
+### 2. **Test DNS Resolution**
+```bash
+# Test DNS resolution for server instances
+kubectl run test-dns --image=busybox --rm -it --restart=Never -- nslookup server-0.server-headless.poc-routing.svc.cluster.local
+
+# Expected output:
+# Name: server-0.server-headless.poc-routing.svc.cluster.local
+# Address: 10.244.0.3
+
+kubectl run test-dns --image=busybox --rm -it --restart=Never -- nslookup server-1.server-headless.poc-routing.svc.cluster.local
+
+# Expected output:
+# Name: server-1.server-headless.poc-routing.svc.cluster.local
+# Address: 10.244.0.5
+```
+
+### 3. **Test Internal Routing**
+```bash
+# Test /where endpoint (should work from any pod)
+kubectl run test-pod --image=busybox --rm -it --restart=Never -- wget -qO- "http://envoy.poc-routing.svc.cluster.local:10000/where?client_id=123"
+
+# Expected output:
+# {"client_id":"123","hostport":"server-1.server-headless.poc-routing.svc.cluster.local:8081"}
+
+# Test /join endpoint (should route to specific instance)
+kubectl run test-pod --image=busybox --rm -it --restart=Never -- wget -qO- "http://envoy.poc-routing.svc.cluster.local:10000/join?client_id=123"
+
+# Expected output:
+# {"assigned":"server-1:8081","client_id":"123","status":"ok"}
+```
+
+### 4. **Test External Access**
+```bash
+# Get Minikube service URLs
+minikube service envoy -n poc-routing --url
+
+# Test with forwarded URL (replace with actual URL from above command)
+curl "http://127.0.0.1:XXXXX/where?client_id=123"
+curl -v "http://127.0.0.1:XXXXX/join?client_id=123"
+```
+
+### 5. **Check Envoy Logs**
+```bash
+# Check Envoy logs for Lua debug messages
+kubectl logs -n poc-routing deployment/envoy | grep "Lua:"
+
+# Expected output:
+# Lua: /join path /join?client_id=123
+# Lua: resolving client_id=123
+# Lua: resolver status(raw)=200
+# Lua: parsed hostport=server-1.server-headless.poc-routing.svc.cluster.local:8081
+```
+
+### 6. **Check Server Logs**
+```bash
+# Check server logs for /join requests
+kubectl logs -n poc-routing server-0 | grep "/join"
+kubectl logs -n poc-routing server-1 | grep "/join"
+
+# Expected output (only one server should have the log):
+# 2025/09/26 13:21:22 /join: client_id=123 assigned to server-1:8081
+```
+
+### 7. **Verify DNS Cache (Advanced)**
+```bash
+# Check Envoy admin interface for DNS cache stats
+kubectl port-forward -n poc-routing service/envoy 9901:9901
+
+# In another terminal:
+curl "http://localhost:9901/stats" | grep dynamic_forward_proxy
+
+# Look for cache hit/miss statistics
+```
+
 ## Summary
 
 The Envoy configuration implements a sophisticated routing system that:
